@@ -305,3 +305,69 @@ def apply_mask_family_torch(seed: torch.Tensor, masks: List[torch.Tensor]) -> Li
         out.append(apply_mask_xor_torch(seed, m))
     return out
 
+def stack_mask_family_torch(
+    n: int,
+    device: Optional[torch.device] = None,
+    use_sierpinski: bool = True,
+    use_thue_morse: bool = True,
+    extra_random: int = 0,
+    p_random: float = 0.5,
+) -> torch.Tensor:
+    """
+    Like generate_mask_family_torch, but returns a single (M, n) tensor.
+
+    M = number of masks used (1–2 + extra_random).
+
+    Returns:
+        masks: uint8 tensor of shape (M, n) on given device.
+    """
+    mask_list = generate_mask_family_torch(
+        n=n,
+        device=device,
+        use_sierpinski=use_sierpinski,
+        use_thue_morse=use_thue_morse,
+        extra_random=extra_random,
+        p_random=p_random,
+    )
+    if not mask_list:
+        raise ValueError("No masks generated; at least one mask must be enabled.")
+    return torch.stack(mask_list, dim=0)  # (M, n)
+
+
+def apply_mask_family_torch_batch(
+    seeds: torch.Tensor,
+    masks: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply a family of masks to a batch of seeds.
+
+    Args:
+        seeds: (B, n) tensor with {0,1} (any integer/float type).
+        masks: (M, n) uint8 tensor with {0,1} on the same device.
+
+    Returns:
+        masked: (B, M, n) uint8 tensor,
+                where masked[b, m] = seeds[b] XOR masks[m].
+    """
+    if seeds.dim() != 2:
+        raise ValueError(f"seeds must be (B, n), got {tuple(seeds.shape)}")
+    if masks.dim() != 2:
+        raise ValueError(f"masks must be (M, n), got {tuple(masks.shape)}")
+    if seeds.shape[1] != masks.shape[1]:
+        raise ValueError(f"Length mismatch: seeds n={seeds.shape[1]}, masks n={masks.shape[1]}")
+
+    seeds_u = seeds
+    if seeds_u.dtype == torch.bool:
+        seeds_u = seeds_u.to(torch.uint8)
+    elif seeds_u.is_floating_point():
+        seeds_u = torch.round(seeds_u).to(torch.uint8)
+    else:
+        seeds_u = seeds_u.to(torch.uint8)
+
+    if not torch.all((seeds_u == 0) | (seeds_u == 1)):
+        raise ValueError("seeds must contain only 0/1 values")
+
+    seeds_expanded = seeds_u.unsqueeze(1)       # (B, 1, n)
+    masks_expanded = masks.unsqueeze(0)        # (1, M, n)
+    masked = torch.bitwise_xor(seeds_expanded, masks_expanded)  # (B, M, n)
+    return masked

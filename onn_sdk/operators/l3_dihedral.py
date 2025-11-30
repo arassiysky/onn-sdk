@@ -21,8 +21,8 @@ import torch
 from .l1_triangle import (
     xnor_triangle_numpy,
     xnor_triangle_torch,
+    xnor_triangle_torch_batch,     # ← add this
 )
-
 
 # =============================================================================
 # NumPy implementation
@@ -178,3 +178,61 @@ def dihedral_orbit_torch(
             unique.append(v)
     return unique
 
+def triangle_sides_torch_batch(tri: torch.Tensor):
+    """
+    Batched triangle sides from a batched triangle.
+
+    Args:
+        tri: (B, n, n) uint8 tensor from xnor_triangle_torch_batch.
+
+    Returns:
+        top:  (B, n)
+        left: (B, n)
+        right:(B, n)
+    """
+    B, n, _ = tri.shape
+    device = tri.device  # unused but convenient if needed
+
+    top = tri[:, 0, :n]        # (B, n)
+    left = tri[:, :, 0]        # (B, n)
+
+    idx = torch.arange(n, device=tri.device)
+    right = tri[:, idx, n - 1 - idx]  # (B, n)
+
+    return top, left, right
+
+
+def dihedral_sides_torch_batch(
+    s: torch.Tensor,
+    include_reversals: bool = True,
+) -> torch.Tensor:
+    """
+    Batched dihedral sides.
+
+    Args:
+        s: (B, n) binary {0,1}.
+        include_reversals: if True, include reversals.
+
+    Returns:
+        sides: (B, K, n) uint8 tensor where:
+            if include_reversals:
+                K = 6  -> [T, L, R, rev(T), rev(L), rev(R)]
+            else:
+                K = 3  -> [T, L, R]
+    """
+    tri = xnor_triangle_torch_batch(s)  # (B, n, n)
+    B, n, _ = tri.shape
+
+    top, left, right = triangle_sides_torch_batch(tri)  # each (B, n)
+
+    sides = [top, left, right]  # list of (B, n)
+
+    if include_reversals:
+        sides += [
+            torch.flip(top,  dims=[1]),
+            torch.flip(left, dims=[1]),
+            torch.flip(right, dims=[1]),
+        ]
+
+    sides_tensor = torch.stack(sides, dim=1)   # (B, K, n), uint8
+    return sides_tensor

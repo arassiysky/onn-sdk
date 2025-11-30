@@ -218,3 +218,73 @@ def is_balanced_torch(s: torch.Tensor) -> bool:
         return False
     return triangle_one_count_torch(s) * 2 == T
 
+def _check_binary_torch_batch(s: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure s is a 2D binary tensor with values in {0,1}.
+    Shape: (B, n).
+    Returns a uint8 tensor on the same device.
+    """
+    if s.dim() != 2:
+        raise ValueError(f"Expected 2D tensor (batch, n), got shape {tuple(s.shape)}")
+
+    if s.dtype == torch.bool:
+        return s.to(torch.uint8)
+
+    if s.is_floating_point():
+        s_rounded = torch.round(s).to(torch.uint8)
+        if not torch.all((s_rounded == 0) | (s_rounded == 1)):
+            raise ValueError("Floating tensor must contain only ~0.0/~1.0 values")
+        return s_rounded
+
+    if s.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        s_uint = s.to(torch.uint8)
+        if not torch.all((s_uint == 0) | (s_uint == 1)):
+            raise ValueError("Integer tensor must contain only 0/1 values")
+        return s_uint
+
+    raise TypeError(f"Unsupported torch dtype for binary seed batch: {s.dtype}")
+
+
+def xnor_triangle_torch_batch(s: torch.Tensor) -> torch.Tensor:
+    """
+    Batched XNOR triangle in PyTorch.
+
+    Args:
+        s: (B, n) tensor, binary {0,1}, any device.
+
+    Returns:
+        tri: uint8 tensor of shape (B, n, n) on same device as s.
+             For each batch b, tri[b, 0, :n] is the seed,
+             tri[b, row, :n-row] is the row-th triangle row.
+    """
+    s = _check_binary_torch_batch(s)
+    B, n = s.shape
+    device = s.device
+
+    tri = torch.zeros((B, n, n), dtype=torch.uint8, device=device)
+    tri[:, 0, :n] = s
+
+    for row in range(1, n):
+        prev = tri[:, row - 1, : n - (row - 1)]          # (B, n - row + 1)
+        xored = torch.bitwise_xor(prev[:, :-1], prev[:, 1:])  # (B, n - row)
+        tri[:, row, : n - row] = 1 - xored
+
+    return tri
+
+
+def xnor_triangle_torch_flat_batch(s: torch.Tensor) -> torch.Tensor:
+    """
+    Batched flattened XNOR triangle.
+
+    Args:
+        s: (B, n) binary {0,1}.
+
+    Returns:
+        flat: (B, T(n)) float32 tensor, where T(n) = n(n+1)/2.
+    """
+    tri = xnor_triangle_torch_batch(s)      # (B, n, n)
+    B, n, _ = tri.shape
+
+    rows = [tri[:, i, : n - i] for i in range(n)]  # list of (B, n-i)
+    flat_uint8 = torch.cat(rows, dim=1)            # (B, T(n))
+    return flat_uint8.float()
