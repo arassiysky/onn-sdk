@@ -98,8 +98,8 @@ def main():
     n = 100   # XNOR length; T(n) even
     cfg_ds = XNORBalancedDatasetConfig(
         n=n,
-        n_pos=1000,
-        n_neg=1000,
+        n_pos=2000,
+        n_neg=2000,
         use_orbits=False,
         use_masks=True,
         extra_random_masks=0,

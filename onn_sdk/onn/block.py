@@ -6,12 +6,9 @@ import torch
 import torch.nn as nn
 
 from onn_sdk.onn.config import ONNConfig
-from onn_sdk.operators.l1_triangle import xnor_triangle_torch_flat
-from onn_sdk.operators.l3_dihedral import dihedral_orbit_torch
-from onn_sdk.operators.l4_masks import (
-    generate_mask_family_torch,
-    apply_mask_xor_torch,
-)
+from onn_sdk.operators.l1_triangle import xnor_triangle_torch_flat_batch
+from onn_sdk.operators.l3_dihedral import dihedral_sides_torch_batch
+from onn_sdk.operators.l4_masks import stack_mask_family_torch
 
 
 def triangle_feature_dim(n: int) -> int:
@@ -23,11 +20,11 @@ class ONNBlock(nn.Module):
     """
     Minimal ONN block for XNOR-based classification with internal L3/L4 logic.
 
-    Pipeline per seed x ∈ {0,1}^n:
-        1) Optionally expand to dihedral orbit seeds (L3).
-        2) Optionally apply L4 masks to each orbit seed.
-        3) For each transformed seed, build XNOR triangle and flatten.
-        4) Aggregate features across all transforms (mean pooling).
+    Batched pipeline for x ∈ {0,1}^{B×n}:
+        1) Optionally expand to dihedral orbit seeds (L3) → (B, K3, n).
+        2) Optionally apply L4 masks to each orbit seed → (B, K, n).
+        3) For each transformed seed, build XNOR triangle and flatten (L1) → (B, K, T(n)).
+        4) Aggregate features across transforms (mean pooling) → (B, T(n)).
         5) Map {0,1} → {-1,+1} and pass through MLP trunk.
     """
 
@@ -41,8 +38,8 @@ class ONNBlock(nn.Module):
         self.use_masks = cfg.use_masks
         self.extra_random_masks = cfg.extra_random_masks
 
-        # We cache masks per device
-        self._masks: Optional[List[torch.Tensor]] = None
+        # Masks cached as a single (M, n) tensor on a specific device
+        self._masks: Optional[torch.Tensor] = None
         self._masks_device: Optional[torch.device] = None
 
         layers = []
@@ -59,65 +56,31 @@ class ONNBlock(nn.Module):
         self.mlp = nn.Sequential(*layers)
 
     # ------------------------------------------------------------------
-    # L4 mask cache
+    # L4 mask cache (batched)
     # ------------------------------------------------------------------
 
-    def _get_masks(self, device: torch.device) -> List[torch.Tensor]:
+    def _get_masks(self, device: torch.device) -> Optional[torch.Tensor]:
         """
-        Return cached L4 masks on the given device, generating them on first use.
+        Return cached L4 masks as a tensor of shape (M, n) on the given device,
+        generating them on first use.
         """
         if not self.use_masks:
-            return []
+            return None
 
         if self._masks is None or self._masks_device != device:
-            self._masks = generate_mask_family_torch(
+            self._masks = stack_mask_family_torch(
                 n=self.n,
                 device=device,
                 use_sierpinski=True,
                 use_thue_morse=True,
                 extra_random=self.extra_random_masks,
-            )
+                p_random=0.5,
+            )  # (M, n)
             self._masks_device = device
         return self._masks
 
     # ------------------------------------------------------------------
-    # L3+L4 augmentation per seed
-    # ------------------------------------------------------------------
-
-    def _augment_seed(self, seed: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Apply L3 dihedral orbit and L4 masks to a single seed.
-
-        Args:
-            seed: 1D tensor of shape (n,) in {0,1}, dtype uint8.
-
-        Returns:
-            List of transformed seeds (each shape (n,), uint8).
-        """
-        device = seed.device
-
-        # Start with the original seed
-        seeds: List[torch.Tensor] = [seed]
-
-        # L3 orbits
-        if self.use_orbits:
-            seeds = dihedral_orbit_torch(seed, include_reversals=True)
-
-        # L4 masks
-        if self.use_masks:
-            masks = self._get_masks(device)
-            if masks:
-                expanded: List[torch.Tensor] = []
-                for s in seeds:
-                    expanded.append(s)
-                    for m in masks:
-                        expanded.append(apply_mask_xor_torch(s, m))
-                seeds = expanded
-
-        return seeds
-
-    # ------------------------------------------------------------------
-    # Seeds → triangle features
+    # Seeds → triangle features (batched L1+L3+L4)
     # ------------------------------------------------------------------
 
     def _seeds_to_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -128,38 +91,61 @@ class ONNBlock(nn.Module):
         if x.dim() != 2 or x.size(1) != self.n:
             raise ValueError(f"Expected input of shape (B, {self.n}), got {tuple(x.shape)}")
 
-        # Ensure binary 0/1 uint8 for L1 operator
+        # Ensure binary 0/1 uint8 for operator layers
         if x.is_floating_point():
             x_bin = torch.round(x).to(torch.uint8)
         else:
             x_bin = x.to(torch.uint8)
 
-        batch_size = x_bin.size(0)
+        if not torch.all((x_bin == 0) | (x_bin == 1)):
+            raise ValueError("Input x must contain only 0/1 values")
+
+        B, n = x_bin.shape
         device = x_bin.device
 
-        feats_batch: List[torch.Tensor] = []
+        # -------- L3: dihedral orbit seeds (or identity) --------
+        if self.use_orbits:
+            base_seeds = dihedral_sides_torch_batch(
+                x_bin,
+                include_reversals=True,
+            )  # (B, Kb, n), uint8
+        else:
+            base_seeds = x_bin.unsqueeze(1)  # (B, 1, n)
 
-        for i in range(batch_size):
-            seed = x_bin[i]  # (n,)
-            transformed_seeds = self._augment_seed(seed)
+        B, Kb, n = base_seeds.shape
 
-            # Build triangle features for each transformed seed
-            feats_list: List[torch.Tensor] = []
-            for s in transformed_seeds:
-                flat = xnor_triangle_torch_flat(s)  # (T(n),), uint8
-                feats_list.append(flat.to(torch.float32))
+        # -------- L4: masks (optional) --------
+        masks = self._get_masks(device)  # (M, n) or None
 
-            # Aggregate across transforms (mean pooling)
-            feats_stack = torch.stack(feats_list, dim=0)  # (K, T(n))
-            feats_agg = feats_stack.mean(dim=0)           # (T(n),)
+        if masks is not None and masks.numel() > 0:
+            M = masks.size(0)
 
-            feats_batch.append(feats_agg)
+            seeds_orig = base_seeds  # (B, Kb, n)
 
-        feat_tensor = torch.stack(feats_batch, dim=0)     # (B, T(n))
+            masked = torch.bitwise_xor(
+                base_seeds.unsqueeze(2),           # (B, Kb, 1, n)
+                masks.view(1, 1, M, n),           # (1, 1, M, n)
+            )                                      # (B, Kb, M, n)
+
+            masked = masked.view(B, Kb * M, n)     # (B, Kb*M, n)
+
+            all_seeds = torch.cat([seeds_orig, masked], dim=1)  # (B, K, n)
+        else:
+            all_seeds = base_seeds  # (B, Kb, n)
+
+        B, K, n = all_seeds.shape
+
+        # -------- L1: XNOR triangles for all transformed seeds --------
+        seeds_flat = all_seeds.view(B * K, n)                # (B*K, n)
+        tri_flat = xnor_triangle_torch_flat_batch(seeds_flat)  # (B*K, T(n))
+        T = tri_flat.size(1)
+
+        tri_features = tri_flat.view(B, K, T).float()        # (B, K, T)
+        feats_agg = tri_features.mean(dim=1)                 # (B, T)
 
         # Map {0,1} → {-1,+1} for better conditioning
-        feat_tensor = 2.0 * feat_tensor - 1.0
-        return feat_tensor
+        feats = 2.0 * feats_agg - 1.0                        # (B, T)
+        return feats
 
     # ------------------------------------------------------------------
     # Forward
@@ -176,3 +162,4 @@ class ONNBlock(nn.Module):
         feats = self._seeds_to_features(x)
         logits = self.mlp(feats)
         return logits
+    
