@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ def triangle_feature_dim(n: int) -> int:
 
 class ONNBlock(nn.Module):
     """
-    Minimal ONN block for XNOR-based classification with internal L3/L4 logic.
+    ONN block for XNOR-based classification with internal L3/L4 logic.
 
     Batched pipeline for x ∈ {0,1}^{B×n}:
         1) Optionally expand to dihedral orbit seeds (L3) → (B, K3, n).
@@ -26,6 +26,10 @@ class ONNBlock(nn.Module):
         3) For each transformed seed, build XNOR triangle and flatten (L1) → (B, K, T(n)).
         4) Aggregate features across transforms (mean pooling) → (B, T(n)).
         5) Map {0,1} → {-1,+1} and pass through MLP trunk.
+
+    This module can be used either as:
+        - a standalone binary classifier (balancedness) when return_features=False, or
+        - a backbone / feature extractor when return_features=True.
     """
 
     def __init__(self, cfg: ONNConfig):
@@ -42,18 +46,19 @@ class ONNBlock(nn.Module):
         self._masks: Optional[torch.Tensor] = None
         self._masks_device: Optional[torch.device] = None
 
-        layers = []
+        # MLP trunk split into body + head_bal for single-task mode
+        body_layers = []
         in_dim = self.feature_dim
         for _ in range(cfg.num_layers):
-            layers.append(nn.Linear(in_dim, cfg.hidden_dim))
-            layers.append(nn.ReLU())
+            body_layers.append(nn.Linear(in_dim, cfg.hidden_dim))
+            body_layers.append(nn.ReLU())
             if cfg.dropout > 0.0:
-                layers.append(nn.Dropout(cfg.dropout))
+                body_layers.append(nn.Dropout(cfg.dropout))
             in_dim = cfg.hidden_dim
 
-        # Final binary classifier head
-        layers.append(nn.Linear(in_dim, 1))
-        self.mlp = nn.Sequential(*layers)
+        self.mlp_body = nn.Sequential(*body_layers)
+        # Head used in single-task mode (balancedness)
+        self.head_bal = nn.Linear(in_dim, 1)
 
     # ------------------------------------------------------------------
     # L4 mask cache (batched)
@@ -123,11 +128,11 @@ class ONNBlock(nn.Module):
             seeds_orig = base_seeds  # (B, Kb, n)
 
             masked = torch.bitwise_xor(
-                base_seeds.unsqueeze(2),           # (B, Kb, 1, n)
-                masks.view(1, 1, M, n),           # (1, 1, M, n)
-            )                                      # (B, Kb, M, n)
+                base_seeds.unsqueeze(2),        # (B, Kb, 1, n)
+                masks.view(1, 1, M, n),         # (1, 1, M, n)
+            )                                     # (B, Kb, M, n)
 
-            masked = masked.view(B, Kb * M, n)     # (B, Kb*M, n)
+            masked = masked.view(B, Kb * M, n)    # (B, Kb*M, n)
 
             all_seeds = torch.cat([seeds_orig, masked], dim=1)  # (B, K, n)
         else:
@@ -136,30 +141,45 @@ class ONNBlock(nn.Module):
         B, K, n = all_seeds.shape
 
         # -------- L1: XNOR triangles for all transformed seeds --------
-        seeds_flat = all_seeds.view(B * K, n)                # (B*K, n)
-        tri_flat = xnor_triangle_torch_flat_batch(seeds_flat)  # (B*K, T(n))
+        seeds_flat = all_seeds.view(B * K, n)                         # (B*K, n)
+        tri_flat = xnor_triangle_torch_flat_batch(seeds_flat)         # (B*K, T(n))
         T = tri_flat.size(1)
 
-        tri_features = tri_flat.view(B, K, T).float()        # (B, K, T)
-        feats_agg = tri_features.mean(dim=1)                 # (B, T)
+        tri_features = tri_flat.view(B, K, T).float()                 # (B, K, T)
+        feats_agg = tri_features.mean(dim=1)                          # (B, T)
 
         # Map {0,1} → {-1,+1} for better conditioning
-        feats = 2.0 * feats_agg - 1.0                        # (B, T)
+        feats = 2.0 * feats_agg - 1.0                                 # (B, T)
         return feats
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_features: bool = False) -> torch.Tensor:
         """
         Args:
             x: (B, n) seeds in {0,1}, type float or int.
+            return_features: if True, return backbone features z instead of logits.
 
         Returns:
-            logits: (B, 1) tensor of raw logits (before sigmoid).
+            If return_features=False:
+                logits: (B, 1) tensor of raw logits for balancedness.
+            If return_features=True:
+                z: (B, D) tensor of latent features (D = hidden_dim if num_layers > 0, else T(n)).
         """
-        feats = self._seeds_to_features(x)
-        logits = self.mlp(feats)
+        feats = self._seeds_to_features(x)  # (B, T(n))
+
+        # Pass through MLP body if any layers are defined.
+        if self.cfg.num_layers > 0:
+            z = self.mlp_body(feats)       # (B, hidden_dim)
+        else:
+            z = feats                      # (B, T(n))
+
+        if return_features:
+            return z
+
+        logits = self.head_bal(z)          # (B, 1)
         return logits
+
     

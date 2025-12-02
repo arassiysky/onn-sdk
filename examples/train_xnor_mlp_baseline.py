@@ -127,7 +127,7 @@ def main():
 
     model = MLPBaseline(
         n=n,
-        hidden_dim=128,
+        hidden_dim=256,
         num_layers=2,
         dropout=0.1,
     ).to(device)
@@ -135,7 +135,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
     # ----------------- 3. Training loop -----------------
-    epochs = 10
+    epochs = 20
     for epoch in range(1, epochs + 1):
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
         val_loss, val_acc = eval_epoch(model, val_loader, device)

@@ -23,6 +23,7 @@ from onn_sdk.operators.l4_masks import (
     generate_mask_family_numpy,
     apply_mask_family_numpy,
 )
+from onn_sdk.operators.l3_dihedral import orbit_size_class_numpy
 
 
 # ---------------------------------------------------------------------------
@@ -191,3 +192,27 @@ def build_xnor_balanced_dataset(
         y = y[perm]
 
     return X, y
+
+def build_xnor_balanced_multitask_dataset(
+    cfg: XNORBalancedDatasetConfig,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Multi-task variant of the XNOR dataset builder.
+
+    Returns:
+        X        : (N, n) uint8 seeds
+        y_bal    : (N,) int64 labels in {0,1} (balancedness)
+        y_orbit  : (N,) int64 labels in {0,1,2,3} (orbit size classes for {1,2,3,6})
+    """
+    # Reuse the existing single-task builder for X and y_bal.
+    X, y_bal = build_xnor_balanced_dataset(cfg)  # X: (N, n), y_bal: (N,)
+
+    N = X.shape[0]
+    y_orbit = np.empty(N, dtype=np.int64)
+
+    # Compute orbit size class for each seed.
+    for i in range(N):
+        seed = X[i]  # shape (n,)
+        y_orbit[i] = orbit_size_class_numpy(seed)  # in {0,1,2,3}
+
+    return X, y_bal, y_orbit

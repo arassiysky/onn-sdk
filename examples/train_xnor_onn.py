@@ -95,11 +95,11 @@ def eval_epoch(model, loader, device):
 
 def main():
     # ----------------- 1. Build dataset -----------------
-    n = 100   # XNOR length; T(n) even
+    n = 15   # XNOR length; T(n) even
     cfg_ds = XNORBalancedDatasetConfig(
         n=n,
-        n_pos=2000,
-        n_neg=2000,
+        n_pos=6000,
+        n_neg=6000,
         use_orbits=False,
         use_masks=True,
         extra_random_masks=0,
@@ -128,8 +128,8 @@ def main():
 
     cfg_onn = ONNConfig(
         n=n,
-        hidden_dim=128,
-        num_layers=2,
+        hidden_dim=64,
+        num_layers=1,
         dropout=0.1,
         use_orbits=True,          # L3 inside the model
         use_masks=False,          # L4 inside the model
@@ -141,7 +141,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
     # ----------------- 3. Training loop -----------------
-    epochs = 10
+    epochs = 20
     for epoch in range(1, epochs + 1):
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
         val_loss, val_acc = eval_epoch(model, val_loader, device)

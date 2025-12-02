@@ -236,3 +236,52 @@ def dihedral_sides_torch_batch(
 
     sides_tensor = torch.stack(sides, dim=1)   # (B, K, n), uint8
     return sides_tensor
+
+# =============================================================================
+# Orbit size helpers (NumPy) for dataset building
+# =============================================================================
+
+# Mapping from raw orbit size to a compact class label.
+_ORBIT_SIZE_TO_CLASS = {
+    1: 0,
+    2: 1,
+    3: 2,
+    6: 3,
+}
+
+
+def orbit_size_numpy(s: np.ndarray, include_reversals: bool = True) -> int:
+    """
+    Compute the dihedral orbit size of a seed s using NumPy.
+
+    Args:
+        s: 1D binary array of shape (n,).
+        include_reversals: passed to dihedral_orbit_numpy.
+
+    Returns:
+        size: orbit size, guaranteed to be one of {1, 2, 3, 6}.
+
+    Raises:
+        ValueError if an unexpected orbit size is encountered.
+    """
+    s = np.asarray(s, dtype=np.uint8)
+    orbit = dihedral_orbit_numpy(s, include_reversals=include_reversals)
+    size = len(orbit)
+    if size not in _ORBIT_SIZE_TO_CLASS:
+        raise ValueError(f"Unexpected orbit size {size}; expected one of {list(_ORBIT_SIZE_TO_CLASS.keys())}.")
+    return size
+
+
+def orbit_size_class_numpy(s: np.ndarray, include_reversals: bool = True) -> int:
+    """
+    Orbit size as a class label in {0,1,2,3} corresponding to sizes {1,2,3,6}.
+
+    Args:
+        s: 1D binary array.
+        include_reversals: passed to orbit_size_numpy.
+
+    Returns:
+        class_id: int in {0,1,2,3}.
+    """
+    size = orbit_size_numpy(s, include_reversals=include_reversals)
+    return _ORBIT_SIZE_TO_CLASS[size]
