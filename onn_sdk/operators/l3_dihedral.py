@@ -21,12 +21,13 @@ import torch
 from .l1_triangle import (
     xnor_triangle_numpy,
     xnor_triangle_torch,
-    xnor_triangle_torch_batch,     # ← add this
+    xnor_triangle_torch_batch,
 )
 
 # =============================================================================
 # NumPy implementation
 # =============================================================================
+
 
 def triangle_sides_numpy(s: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -37,6 +38,10 @@ def triangle_sides_numpy(s: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndar
     L: left boundary    (first column)
     R: right boundary   (descending diagonal)
     """
+    s = np.asarray(s, dtype=np.uint8)
+    if s.ndim != 1:
+        raise ValueError(f"Expected 1D array, got shape {s.shape}")
+
     tri = xnor_triangle_numpy(s)
     n = tri.shape[0]
 
@@ -106,22 +111,28 @@ def dihedral_orbit_numpy(s: np.ndarray, include_reversals: bool = True) -> List[
 
 
 # =============================================================================
-# PyTorch implementation
+# PyTorch implementation (single-seed)
 # =============================================================================
+
 
 def triangle_sides_torch(s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Torch version of triangle_sides_numpy.
+    Torch version of triangle_sides_numpy for a single seed.
 
     Args:
-        s: 1D binary tensor of length n.
+        s: 1D binary tensor of length n, dtype uint8 or bool or int/float 0/1.
 
     Returns:
         (top, left, right): each is a 1D tensor of shape (n,) on s.device.
     """
+    if s.dim() != 1:
+        raise ValueError(f"Expected 1D tensor, got shape {tuple(s.shape)}")
+
+    # xnor_triangle_torch does its own binary checks/casting;
+    # we just pass s through.
     tri = xnor_triangle_torch(s)
     n = tri.shape[0]
-    device = s.device
+    device = tri.device
     dtype = tri.dtype
 
     top = tri[0, :n].clone()
@@ -159,7 +170,7 @@ def dihedral_orbit_torch(
     include_reversals: bool = True,
 ) -> List[torch.Tensor]:
     """
-    Torch version of dihedral_orbit_numpy.
+    Torch version of dihedral_orbit_numpy for a single seed.
 
     Returns:
         List of distinct side seeds on the same device as s.
@@ -178,7 +189,15 @@ def dihedral_orbit_torch(
             unique.append(v)
     return unique
 
-def triangle_sides_torch_batch(tri: torch.Tensor):
+
+# =============================================================================
+# PyTorch implementation (batched)
+# =============================================================================
+
+
+def triangle_sides_torch_batch(
+    tri: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Batched triangle sides from a batched triangle.
 
@@ -190,11 +209,15 @@ def triangle_sides_torch_batch(tri: torch.Tensor):
         left: (B, n)
         right:(B, n)
     """
-    B, n, _ = tri.shape
-    device = tri.device  # unused but convenient if needed
+    if tri.dim() != 3:
+        raise ValueError(f"Expected (B, n, n) tensor, got shape {tuple(tri.shape)}")
 
-    top = tri[:, 0, :n]        # (B, n)
-    left = tri[:, :, 0]        # (B, n)
+    B, n, m = tri.shape
+    if n != m:
+        raise ValueError(f"Triangle must be square (n x n), got {n}x{m}")
+
+    top = tri[:, 0, :n]   # (B, n)
+    left = tri[:, :, 0]   # (B, n)
 
     idx = torch.arange(n, device=tri.device)
     right = tri[:, idx, n - 1 - idx]  # (B, n)
@@ -210,7 +233,7 @@ def dihedral_sides_torch_batch(
     Batched dihedral sides.
 
     Args:
-        s: (B, n) binary {0,1}.
+        s: (B, n) binary {0,1} (uint8 / bool / ints or floats ~0/1).
         include_reversals: if True, include reversals.
 
     Returns:
@@ -220,9 +243,11 @@ def dihedral_sides_torch_batch(
             else:
                 K = 3  -> [T, L, R]
     """
-    tri = xnor_triangle_torch_batch(s)  # (B, n, n)
-    B, n, _ = tri.shape
+    if s.dim() != 2:
+        raise ValueError(f"Expected input (B, n), got shape {tuple(s.shape)}")
 
+    # Let xnor_triangle_torch_batch handle casting & binary checks
+    tri = xnor_triangle_torch_batch(s)  # (B, n, n)
     top, left, right = triangle_sides_torch_batch(tri)  # each (B, n)
 
     sides = [top, left, right]  # list of (B, n)
@@ -237,11 +262,13 @@ def dihedral_sides_torch_batch(
     sides_tensor = torch.stack(sides, dim=1)   # (B, K, n), uint8
     return sides_tensor
 
+
 # =============================================================================
 # Orbit size helpers (NumPy) for dataset building
 # =============================================================================
 
 # Mapping from raw orbit size to a compact class label.
+# 1 → 0, 2 → 1, 3 → 2, 6 → 3
 _ORBIT_SIZE_TO_CLASS = {
     1: 0,
     2: 1,
@@ -268,7 +295,10 @@ def orbit_size_numpy(s: np.ndarray, include_reversals: bool = True) -> int:
     orbit = dihedral_orbit_numpy(s, include_reversals=include_reversals)
     size = len(orbit)
     if size not in _ORBIT_SIZE_TO_CLASS:
-        raise ValueError(f"Unexpected orbit size {size}; expected one of {list(_ORBIT_SIZE_TO_CLASS.keys())}.")
+        raise ValueError(
+            f"Unexpected orbit size {size}; "
+            f"expected one of {list(_ORBIT_SIZE_TO_CLASS.keys())}."
+        )
     return size
 
 

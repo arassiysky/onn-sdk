@@ -6,13 +6,19 @@ import torch
 import torch.nn as nn
 
 from onn_sdk.onn.config import ONNConfig
-from onn_sdk.operators.l1_triangle import xnor_triangle_torch_flat_batch
-from onn_sdk.operators.l3_dihedral import dihedral_sides_torch_batch
-from onn_sdk.operators.l4_masks import stack_mask_family_torch
+from onn_sdk.operators.l1_triangle import (
+    xnor_triangle_torch_flat_batch,   # batched L1: (N, n) -> (N, T(n))
+)
+from onn_sdk.operators.l3_dihedral import (
+    dihedral_sides_torch_batch,       # batched L3: (B, n) -> (B, K3, n)
+)
+from onn_sdk.operators.l4_masks import (
+    stack_mask_family_torch,          # (M, n) masks
+)
 
 
 def triangle_feature_dim(n: int) -> int:
-    """T(n) = n(n+1)/2"""
+    """T(n) = n(n+1)//2"""
     return n * (n + 1) // 2
 
 
@@ -23,7 +29,7 @@ class ONNBlock(nn.Module):
     Batched pipeline for x ∈ {0,1}^{B×n}:
         1) Optionally expand to dihedral orbit seeds (L3) → (B, K3, n).
         2) Optionally apply L4 masks to each orbit seed → (B, K, n).
-        3) For each transformed seed, build XNOR triangle and flatten (L1) → (B, K, T(n)).
+        3) Build XNOR triangles and flatten for all transformed seeds (L1) in batch.
         4) Aggregate features across transforms (mean pooling) → (B, T(n)).
         5) Map {0,1} → {-1,+1} and pass through MLP trunk.
 
@@ -61,7 +67,7 @@ class ONNBlock(nn.Module):
         self.head_bal = nn.Linear(in_dim, 1)
 
     # ------------------------------------------------------------------
-    # L4 mask cache (batched)
+    # L4 mask cache
     # ------------------------------------------------------------------
 
     def _get_masks(self, device: torch.device) -> Optional[torch.Tensor]:
@@ -108,49 +114,67 @@ class ONNBlock(nn.Module):
         B, n = x_bin.shape
         device = x_bin.device
 
-        # -------- L3: dihedral orbit seeds (or identity) --------
+        # ---- L3: dihedral orbits (batched) ----
         if self.use_orbits:
-            base_seeds = dihedral_sides_torch_batch(
+            # Expect dihedral_sides_torch_batch(x_bin, include_reversals=True)
+            # to return something like (B, K3, n), where K3 ∈ {1,2,3,6}.
+            seeds = dihedral_sides_torch_batch(
                 x_bin,
                 include_reversals=True,
-            )  # (B, Kb, n), uint8
+            )  # (B, K3, n)
         else:
-            base_seeds = x_bin.unsqueeze(1)  # (B, 1, n)
+            seeds = x_bin.unsqueeze(1)  # (B, 1, n)
 
-        B, Kb, n = base_seeds.shape
+        # ---- L4: masks (apply via XOR, batched) ----
+        if self.use_masks:
+            masks = self._get_masks(device)  # (M, n) or None
+            if masks is not None and masks.numel() > 0:
+                B, K3, n = seeds.shape
+                M = masks.shape[0]
 
-        # -------- L4: masks (optional) --------
-        masks = self._get_masks(device)  # (M, n) or None
+                # base seeds kept
+                seeds_base = seeds  # (B, K3, n)
 
-        if masks is not None and masks.numel() > 0:
-            M = masks.size(0)
+                # expand seeds and masks for pairwise XOR
+                seeds_exp = seeds_base.unsqueeze(2)          # (B, K3, 1, n)
+                masks_exp = masks.view(1, 1, M, n)          # (1, 1, M, n)
+                seeds_exp = seeds_exp.expand(B, K3, M, n)   # (B, K3, M, n)
+                masks_exp = masks_exp.expand(B, K3, M, n)   # (B, K3, M, n)
 
-            seeds_orig = base_seeds  # (B, Kb, n)
+                masked = torch.bitwise_xor(
+                    seeds_exp,
+                    masks_exp.to(device=device, dtype=torch.uint8),
+                )                                           # (B, K3, M, n)
 
-            masked = torch.bitwise_xor(
-                base_seeds.unsqueeze(2),        # (B, Kb, 1, n)
-                masks.view(1, 1, M, n),         # (1, 1, M, n)
-            )                                     # (B, Kb, M, n)
+                # Flatten mask dimension into orbit dimension
+                masked = masked.reshape(B, K3 * M, n)       # (B, K3*M, n)
 
-            masked = masked.view(B, Kb * M, n)    # (B, Kb*M, n)
-
-            all_seeds = torch.cat([seeds_orig, masked], dim=1)  # (B, K, n)
+                # Concatenate unmasked + masked along orbit dimension
+                seeds_all = torch.cat([seeds_base, masked], dim=1)  # (B, K, n)
+            else:
+                seeds_all = seeds  # no masks
         else:
-            all_seeds = base_seeds  # (B, Kb, n)
+            seeds_all = seeds      # no masks
 
-        B, K, n = all_seeds.shape
+        B, K, n = seeds_all.shape
 
-        # -------- L1: XNOR triangles for all transformed seeds --------
-        seeds_flat = all_seeds.view(B * K, n)                         # (B*K, n)
-        tri_flat = xnor_triangle_torch_flat_batch(seeds_flat)         # (B*K, T(n))
-        T = tri_flat.size(1)
+        # ---- L1: XNOR triangles for all transformed seeds (batched) ----
+        # Flatten (B, K, n) -> (B*K, n)
+        seeds_flat = seeds_all.reshape(B * K, n)            # (B*K, n)
 
-        tri_features = tri_flat.view(B, K, T).float()                 # (B, K, T)
-        feats_agg = tri_features.mean(dim=1)                          # (B, T)
+        # Compute flattened XNOR triangles for all seeds in one call
+        feats_flat = xnor_triangle_torch_flat_batch(seeds_flat)  # (B*K, T(n))
+
+        # Reshape back to (B, K, T(n))
+        feats = feats_flat.reshape(B, K, self.feature_dim)  # (B, K, T(n))
+
+        # Aggregate across transforms (mean pooling over K)
+        feats_agg = feats.mean(dim=1)                       # (B, T(n))
 
         # Map {0,1} → {-1,+1} for better conditioning
-        feats = 2.0 * feats_agg - 1.0                                 # (B, T)
-        return feats
+        feat_tensor = feats_agg.to(torch.float32)
+        feat_tensor = 2.0 * feat_tensor - 1.0               # (B, T(n))
+        return feat_tensor
 
     # ------------------------------------------------------------------
     # Forward
@@ -181,5 +205,3 @@ class ONNBlock(nn.Module):
 
         logits = self.head_bal(z)          # (B, 1)
         return logits
-
-    
